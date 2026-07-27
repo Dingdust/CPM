@@ -1,0 +1,22 @@
+numpy==1.26.4
+datasets
+soundfile
+librosa
+pyarrow
+snac
+transformers
+speechbrain
+onnxruntime
+funasr
+addict
+flask
+flask-cors
+flask-sock
+gradio
+pydub
+pillow
+swanlab
+modelscope
+# torch
+# torchaudio
+# torchvision
