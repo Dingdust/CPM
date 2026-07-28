@@ -1779,10 +1779,10 @@ def log_model_params(model, ignore_patterns=None):
         Logger(f'Model Params: {total:.2f}M')
 
 
-def init_omni_model(omni_config, from_weight='full_sft', tokenizer_path='../model',
-                    audio_encoder_path='../model/SenseVoiceSmall',
-                    vision_model_path='../model/siglip2-base-p32-256-ve',
-                    save_dir='../out', checkpoint_dir='../checkpoints',
+def init_omni_model(omni_config, from_weight='full_sft', tokenizer_path='./model',
+                    audio_encoder_path='./model/SenseVoiceSmall',
+                    vision_model_path='./model/siglip2-base-p32-256-ve',
+                    save_dir='./out', checkpoint_dir='./checkpoints',
                     device='cuda', freeze_backbone='none', from_resume=0):
     """
     初始化 PigCPMOmni 模型 + tokenizer。
@@ -1849,7 +1849,7 @@ def init_omni_model(omni_config, from_weight='full_sft', tokenizer_path='../mode
 
 
 def omni_checkpoint(omni_config, weight='pretrain_omni', model=None, optimizer=None,
-                    epoch=0, step=0, swanlab_run=None, save_dir='../checkpoints', **kwargs):
+                    epoch=0, step=0, swanlab_run=None, save_dir='./checkpoints', **kwargs):
     """
     通用 Checkpoint 保存/加载。
     - 保存 (model is not None): 存 clean_state_dict + optimizer/swanlab 状态
@@ -2129,12 +2129,12 @@ def main():
     """PigCPM-O 多模态训练主入口。"""
     parser = argparse.ArgumentParser(description="PigCPM-O 多模态训练脚本")
     parser.add_argument("--data_path", type=str, default='./data/train.parquet', help="训练数据路径")
-    parser.add_argument("--checkpoint_dir", type=str, default='../checkpoints', help="checkpoint保存目录")
+    parser.add_argument("--checkpoint_dir", type=str, default='./checkpoints', help="checkpoint保存目录")
     parser.add_argument("--checkpoint_name", type=str, default='pigcpm_o', help="checkpoint名称")
-    parser.add_argument("--save_dir", type=str, default='../out', help="权重保存目录")
-    parser.add_argument("--tokenizer_path", type=str, default='../model', help="Tokenizer路径")
-    parser.add_argument("--audio_encoder_path", type=str, default='../model/SenseVoiceSmall', help="SenseVoice路径")
-    parser.add_argument("--vision_model_path", type=str, default='../model/siglip2-base-p32-256-ve', help="SigLIP路径")
+    parser.add_argument("--save_dir", type=str, default='./out', help="权重保存目录")
+    parser.add_argument("--tokenizer_path", type=str, default='./model', help="Tokenizer路径")
+    parser.add_argument("--audio_encoder_path", type=str, default='./model/SenseVoiceSmall', help="SenseVoice路径")
+    parser.add_argument("--vision_model_path", type=str, default='./model/siglip2-base-p32-256-ve', help="SigLIP路径")
     parser.add_argument("--from_weight", type=str, default='full_sft', help="加载预训练权重名")
     parser.add_argument("--from_resume", type=int, default=0, help="断点续训步数")
     parser.add_argument("--freeze_backbone", type=str, default='none', choices=['none', 'all', 'last1'], help="冻结策略")
