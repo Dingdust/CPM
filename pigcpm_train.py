@@ -2120,7 +2120,7 @@ def _create_dataloader(args, model, tokenizer, skip_batches=0):
     train_loader = DataLoader(
         train_dataset, batch_sampler=train_sampler,
         collate_fn=omni_collate_fn, num_workers=args.num_workers,
-        pin_memory=True, drop_last=True
+        pin_memory=True
     )
     return train_dataset, sampler, train_loader
 
