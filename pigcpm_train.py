@@ -1845,7 +1845,10 @@ def init_omni_model(omni_config, from_weight='full_sft', tokenizer_path='./model
             for param in model.thinker.layers[-1].parameters():
                 param.requires_grad = True
 
-    return model.to(device), tokenizer
+    model = model.to(device)
+    if model.vision_encoder is not None:
+        model.vision_encoder = model.vision_encoder.to(device)
+    return model, tokenizer
 
 
 def omni_checkpoint(omni_config, weight='pretrain_omni', model=None, optimizer=None,
@@ -2039,8 +2042,8 @@ def train_epoch(model, train_loader, optimizer, epoch, device, local_rank, args,
             audio_loss = 0.0
             for i in range(8):
                 audio_loss += F.cross_entropy(
-                    audio_logits[i].view(-1, audio_logits[i].size(-1)),
-                    audio_labels[:, i, :].view(-1),
+                    audio_logits[i].reshape(-1, audio_logits[i].size(-1)),
+                    audio_labels[:, i, :].reshape(-1),
                     ignore_index=-100
                 )
 
