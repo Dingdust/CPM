@@ -1790,7 +1790,7 @@ def init_omni_model(omni_config, from_weight='full_sft', tokenizer_path='../mode
     - freeze_backbone: 'all'（冻结所有）、'last1'（解冻最后一层）、'none'
     - from_resume: 断点续训步数（0 表示从头）
     """
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    tokenizer = AutoTokenizer.from_pretrained(os.path.abspath(tokenizer_path))
     model = PigCPMOmni(omni_config, audio_encoder_path=audio_encoder_path,
                        vision_model_path=vision_model_path)
 
