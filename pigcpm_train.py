@@ -1,25 +1,19 @@
-"""
-PigCPM-O 全流程整合训练脚本
-整合自: model/model_pigcpm.py | model/model_omni.py | dataset/omni_dataset.py |
-         trainer/trainer_utils.py | trainer/train_sft_omni.py
-"""
-# ── 标准库 ──────────────────────────────────────────────────────────────────
+# ── 标准库 ──
+import io
 import os
-import math
 import json
+import math
 import time
 import random
-import warnings
 import logging
-import contextlib
-import io
+import warnings
 import argparse
 from types import SimpleNamespace
-from contextlib import nullcontext
+from contextlib import nullcontext, redirect_stdout
 
-# ── 数值计算 & 深度学习 ─────────────────────────────────────────────────────
-import numpy as np
+# ── 数值计算 & 深度学习 ──
 import torch
+import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
@@ -27,25 +21,25 @@ from torch import optim
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import Dataset, Sampler, DataLoader, DistributedSampler
 
-# ── 音频 & 图像处理 ─────────────────────────────────────────────────────────
-import soundfile as sf
+# ── 音频 & 图像处理 ──
 import librosa
-from scipy.signal import resample
+import soundfile as sf
 from PIL import Image
+from scipy.signal import resample
 
-# ── 数据处理 ─────────────────────────────────────────────────────────────────
+# ── 数据处理 ──
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-# ── Transformers ─────────────────────────────────────────────────────────────
+# ── Transformers ──
 from transformers.activations import ACT2FN
+from transformers.modeling_outputs import MoeCausalLMOutputWithPast
 from transformers import (
     PreTrainedModel, GenerationMixin, PretrainedConfig, AutoTokenizer,
     SiglipImageProcessor, SiglipVisionModel, logging as hf_logging
 )
-from transformers.modeling_outputs import MoeCausalLMOutputWithPast
 
-warnings.filterwarnings('ignore')
+warnings.filterwarnings("ignore")
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
@@ -107,7 +101,6 @@ def _sample_token(logits, temperature, do_sample=True):
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Section 1: PigCPM 基础模型 —— 定义配置、注意力、FFN、MoE、完整Transformer
-#  (原 model/model_pigcpm.py)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class PigCPMConfig(PretrainedConfig):
@@ -568,7 +561,6 @@ class PigCPMForCausalLM(PreTrainedModel, GenerationMixin):
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Section 2: PigCPM-Omni 多模态模型
 #  音频编码器(SenseVoice) + 视觉编码器(SigLIP) + Thinker + Talker 双塔架构
-#  (原 model/model_omni.py)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class OmniConfig(PigCPMConfig):
@@ -604,22 +596,9 @@ class OmniConfig(PigCPMConfig):
         self.bridge_layer = kwargs.get("bridge_layer", self.num_hidden_layers // 2 - 1)
 
 
-class MMAudioProjector(nn.Module):
-    """音频投影器：将 SenseVoice 编码器输出映射到 Thinker 隐藏空间。"""
+class MMProjector(nn.Module):
+    """多模态投影器：将编码器输出（音频/视觉）映射到 Thinker 隐藏空间。"""
     def __init__(self, in_dim, out_dim):
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.LayerNorm(in_dim), nn.Linear(in_dim, out_dim),
-            nn.GELU(), nn.Linear(out_dim, out_dim),
-        )
-
-    def forward(self, x):
-        return self.mlp(x)
-
-
-class MMVisionProjector(nn.Module):
-    """视觉投影器：将 SigLIP 编码器输出映射到 Thinker 隐藏空间。"""
-    def __init__(self, in_dim, out_dim, source_tokens=64, target_tokens=64):
         super().__init__()
         self.mlp = nn.Sequential(
             nn.LayerNorm(in_dim), nn.Linear(in_dim, out_dim),
@@ -767,10 +746,8 @@ class PigCPMOmni(PigCPMForCausalLM):
         object.__setattr__(self.model, 'lm_head', self.lm_head)
 
         self.talker = TalkerModule(config)
-        self.audio_proj = MMAudioProjector(config.audio_hidden_size, config.hidden_size)
-        self.vision_proj = MMVisionProjector(
-            config.image_hidden_size, config.hidden_size, target_tokens=config.image_token_len
-        )
+        self.audio_proj = MMProjector(config.audio_hidden_size, config.hidden_size)
+        self.vision_proj = MMProjector(config.image_hidden_size, config.hidden_size)
         self.audio_pad_token = config.audio_pad_token
         self.audio_stop_token = config.audio_stop_token
         self.audio_spk_token = config.audio_spk_token
@@ -792,7 +769,7 @@ class PigCPMOmni(PigCPMForCausalLM):
             return None, None
         logging.getLogger().setLevel(logging.ERROR)
         hf_logging.set_verbosity_error()
-        with contextlib.redirect_stdout(io.StringIO()):
+        with redirect_stdout(io.StringIO()):
             from funasr import AutoModel
             m = AutoModel(model=path, trust_remote_code=True, disable_update=True, device="cpu")
         encoder = m.model.encoder
@@ -817,7 +794,7 @@ class PigCPMOmni(PigCPMForCausalLM):
             p.requires_grad = False
         return model.eval(), processor
 
-    # ── 音频编码相关 ────────────────────────────────────────────────────────────
+    # ── 音频编码相关 ──
 
     @torch.compiler.disable
     def encode_audio_inputs(self, audio_inputs, audio_lens=None):
@@ -896,7 +873,7 @@ class PigCPMOmni(PigCPMForCausalLM):
             out.append(hb)
         return torch.stack(out)
 
-    # ── 视觉编码相关 ────────────────────────────────────────────────────────────
+    # ── 视觉编码相关 ──
 
     @torch.compiler.disable
     def get_image_embeddings(self, image_inputs):
@@ -977,7 +954,7 @@ class PigCPMOmni(PigCPMForCausalLM):
             out.append(hb)
         return torch.stack(out)
 
-    # ── 核心前向 & 生成 ────────────────────────────────────────────────────────
+    # ── 核心前向 & 生成 ──
 
     def forward(self, input_ids, attention_mask=None, past_key_values=None, use_cache=False,
                 logits_to_keep=0, audio_inputs=None, audio_lens=None, pixel_values=None, **args):
@@ -1190,16 +1167,13 @@ class PigCPMOmni(PigCPMForCausalLM):
 
         while input_ids.shape[1] < start_pos + max_new_tokens:
             # ── 模型前向 ──
-            if past_kvs is None or not use_cache:
-                out = self.forward(
-                    torch.cat((audio_buffer, input_ids.unsqueeze(1)), dim=1),
-                    past_key_values=past_kvs, use_cache=use_cache, **args
-                )
-            else:
-                out = self.forward(
-                    torch.cat((audio_buffer[:, :, -1:], input_ids[:, -1:].unsqueeze(1)), dim=1),
-                    past_key_values=past_kvs, use_cache=use_cache, **args
-                )
+            use_cache_now = past_kvs is not None and use_cache
+            ab = audio_buffer[:, :, -1:] if use_cache_now else audio_buffer
+            ids = input_ids[:, -1:] if use_cache_now else input_ids
+            out = self.forward(
+                torch.cat((ab, ids.unsqueeze(1)), dim=1),
+                past_key_values=past_kvs, use_cache=use_cache, **args
+            )
             past_kvs = out.past_key_values
 
             # ── 文本采样 ──
@@ -1285,8 +1259,7 @@ class PigCPMOmni(PigCPMForCausalLM):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Section 4: 数据集 —— OmniDataset（多模态数据加载、预处理、增强）
-#  (原 dataset/omni_dataset.py)
+#  Section 3: 数据集 —— OmniDataset（多模态数据加载、预处理、增强）
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def pre_processing_chat(conversations, add_system_ratio=0.2):
@@ -1371,17 +1344,33 @@ class OmniDataset(Dataset):
     def __len__(self):
         return len(self.table)
 
-    # ── 音频处理 ──────────────────────────────────────────────────────────────
+    def _get_col(self, index, name, default=None):
+        """安全获取列数据，列不存在时返回默认值。"""
+        if name in self.table.column_names:
+            val = self.table[name][index].as_py()
+            return val if val is not None else default
+        return default
+
+    # ── 音频处理 ──
+
+    @staticmethod
+    def _read_wav(source, target_sr=16000):
+        """从文件路径或字节流读取波形，统一为单声道(target_sr)。"""
+        if isinstance(source, (str, os.PathLike)):
+            wav, sr = sf.read(str(source))
+        else:
+            wav, sr = sf.read(io.BytesIO(source))
+        if wav.ndim > 1:
+            wav = wav.mean(axis=1)
+        if sr != target_sr:
+            wav = librosa.resample(wav.astype(float), orig_sr=sr, target_sr=target_sr)
+        return wav.astype(np.float32)
 
     @staticmethod
     def process_audio(audio_path, audio_processor):
         """静态方法：加载并预处理音频文件。"""
-        wav, sr = sf.read(audio_path)
-        if wav.ndim > 1:
-            wav = wav.mean(axis=1)
-        if sr != 16000:
-            wav = librosa.resample(wav.astype(float), orig_sr=sr, target_sr=16000)
-        inputs = audio_processor(wav.astype(np.float32), sampling_rate=16000,
+        wav = OmniDataset._read_wav(audio_path)
+        inputs = audio_processor(wav, sampling_rate=16000,
                                  return_tensors="pt", return_attention_mask=True)
         valid_len = inputs.attention_mask.sum().item()
         return inputs.input_features.squeeze(0), valid_len
@@ -1435,18 +1424,14 @@ class OmniDataset(Dataset):
         """加载音频字节流 → fbank 特征 + 长度。"""
         if not audio_bytes:
             return None, 0
-        wav, sr = sf.read(io.BytesIO(audio_bytes))
-        if wav.ndim > 1:
-            wav = wav.mean(axis=1)
-        if sr != 16000:
-            wav = librosa.resample(wav.astype(float), orig_sr=sr, target_sr=16000)
-        wav = self.augment_wav(wav.astype(np.float32))
+        wav = self._read_wav(audio_bytes)
+        wav = self.augment_wav(wav)
         inputs = self.audio_processor(wav, sampling_rate=16000,
                                       return_tensors="pt", return_attention_mask=True)
         valid_len = inputs.attention_mask.sum().item()
         return self.augment_mel(inputs.input_features.squeeze(0)), valid_len
 
-    # ── 图像处理 ──────────────────────────────────────────────────────────────
+    # ── 图像处理 ──
 
     def load_image_inputs(self, image_bytes):
         """加载图像字节流 → 像素张量。"""
@@ -1458,7 +1443,7 @@ class OmniDataset(Dataset):
             return {k: v for k, v in inputs.items()}
         return inputs.pixel_values
 
-    # ── 对话构造 ──────────────────────────────────────────────────────────────
+    # ── 对话构造 ──
 
     def create_chat_prompt(self, conversations, audio_features_length=0):
         """
@@ -1500,7 +1485,7 @@ class OmniDataset(Dataset):
         prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
         return post_processing_chat(prompt)
 
-    # ── 标签生成 ──────────────────────────────────────────────────────────────
+    # ── 标签生成 ──
 
     def generate_text_labels(self, input_ids):
         """
@@ -1636,28 +1621,13 @@ class OmniDataset(Dataset):
           text_labels: (T,)、audio_labels: (8, T)、audio_inputs、audio_len、pixel_values、spk_emb
         """
         conversations = json.loads(self.table['conversations'][index].as_py())
-        question_audios = (
-            self.table['question_audios'][index].as_py()
-            if 'question_audios' in self.table.column_names else []
-        )
-        answer_audios = (
-            self.table['answer_audios'][index].as_py()
-            if 'answer_audios' in self.table.column_names else []
-        )
-        image_bytes = (
-            self.table['image_bytes'][index].as_py()
-            if 'image_bytes' in self.table.column_names else []
-        )
+        question_audios = self._get_col(index, 'question_audios', [])
+        answer_audios = self._get_col(index, 'answer_audios', [])
+        image_bytes = self._get_col(index, 'image_bytes', [])
         if image_bytes and not isinstance(image_bytes, list):
             image_bytes = [image_bytes]
-        ref_audios = (
-            self.table['ref_audios'][index].as_py()
-            if 'ref_audios' in self.table.column_names else []
-        )
-        spk_emb_raw = (
-            self.table['spk_emb'][index].as_py()
-            if 'spk_emb' in self.table.column_names else []
-        )
+        ref_audios = self._get_col(index, 'ref_audios', [])
+        spk_emb_raw = self._get_col(index, 'spk_emb', [])
 
         # ── 多轮对话截断：随机选一个 assistant 轮次（避免超出 max_length）──
         asst_indices = [i for i, t in enumerate(conversations) if t['role'] == 'assistant']
@@ -1735,8 +1705,7 @@ class OmniDataset(Dataset):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Section 5: 训练工具函数
-#  (原 trainer/trainer_utils.py)
+#  Section 4: 训练工具函数
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def is_main_process():
@@ -1813,7 +1782,8 @@ def log_model_params(model, ignore_patterns=None):
 def init_omni_model(omni_config, from_weight='full_sft', tokenizer_path='../model',
                     audio_encoder_path='../model/SenseVoiceSmall',
                     vision_model_path='../model/siglip2-base-p32-256-ve',
-                    save_dir='../out', device='cuda', freeze_backbone='none', from_resume=0):
+                    save_dir='../out', checkpoint_dir='../checkpoints',
+                    device='cuda', freeze_backbone='none', from_resume=0):
     """
     初始化 PigCPMOmni 模型 + tokenizer。
     - from_weight: 预训练权重名（none 为随机初始化）
@@ -1826,8 +1796,19 @@ def init_omni_model(omni_config, from_weight='full_sft', tokenizer_path='../mode
 
     if from_weight != 'none':
         moe_suffix = '_moe' if omni_config.use_moe else ''
-        weight_path = f'{save_dir}/{from_weight}_{omni_config.hidden_size}{moe_suffix}.pth'
-        if os.path.exists(weight_path):
+        # 优先使用 checkpoint_dir，其次 save_dir
+        search_dirs = [checkpoint_dir, save_dir] if checkpoint_dir != save_dir else [save_dir]
+        weight_path = None
+        for d in search_dirs:
+            candidate = f'{d}/{from_weight}_{omni_config.hidden_size}{moe_suffix}.pth'
+            if os.path.exists(candidate):
+                weight_path = candidate
+                break
+            candidate = f'{d}/{from_weight}_{omni_config.hidden_size}.pth'
+            if os.path.exists(candidate):
+                weight_path = candidate
+                break
+        if weight_path is not None:
             weights = torch.load(weight_path, map_location=device)
             param_shapes = {k: v.shape for k, v in model.named_parameters()}
             incompatible = {
@@ -1868,10 +1849,10 @@ def init_omni_model(omni_config, from_weight='full_sft', tokenizer_path='../mode
 
 
 def omni_checkpoint(omni_config, weight='pretrain_omni', model=None, optimizer=None,
-                    epoch=0, step=0, wandb=None, save_dir='../checkpoints', **kwargs):
+                    epoch=0, step=0, swanlab_run=None, save_dir='../checkpoints', **kwargs):
     """
     通用 Checkpoint 保存/加载。
-    - 保存 (model is not None): 存 clean_state_dict + optimizer/wandb 状态
+    - 保存 (model is not None): 存 clean_state_dict + optimizer/swanlab 状态
     - 加载 (model is None): 返回 resume_data，自动处理 GPU 数量变化
     """
     os.makedirs(save_dir, exist_ok=True)
@@ -1880,7 +1861,7 @@ def omni_checkpoint(omni_config, weight='pretrain_omni', model=None, optimizer=N
     resume_path = f'{save_dir}/{weight}_{omni_config.hidden_size}{moe_path}_resume.pth'
 
     if model is not None:
-        # ── 保存 ──
+        # ── 保存权重 ──
         raw_model = model.module if isinstance(model, DistributedDataParallel) else model
         raw_model = getattr(raw_model, '_orig_mod', raw_model)  # torch.compile 兼容
         clean_state_dict = {
@@ -1893,13 +1874,11 @@ def omni_checkpoint(omni_config, weight='pretrain_omni', model=None, optimizer=N
         os.replace(ckp_tmp, ckp_path)
 
         # ── 保存断点续训数据 ──
-        wandb_id = None
-        if wandb:
-            if hasattr(wandb, 'get_run'):
-                run = wandb.get_run()
-                wandb_id = getattr(run, 'id', None) if run else None
-            else:
-                wandb_id = getattr(wandb, 'id', None)
+        swanlab_id = None
+        if swanlab_run is not None:
+            swanlab_id = getattr(swanlab_run, 'public', None)
+            if swanlab_id is not None:
+                swanlab_id = getattr(swanlab_id, 'run_id', None)
 
         resume_data = {
             'model': state_dict,
@@ -1907,7 +1886,7 @@ def omni_checkpoint(omni_config, weight='pretrain_omni', model=None, optimizer=N
             'epoch': epoch,
             'step': step,
             'world_size': dist.get_world_size() if dist.is_initialized() else 1,
-            'wandb_id': wandb_id
+            'swanlab_id': swanlab_id
         }
         for key, value in kwargs.items():
             if value is not None:
@@ -1965,8 +1944,7 @@ class SkipBatchSampler(Sampler):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Section 6: 训练主逻辑 —— omni_collate_fn, train_epoch, main
-#  (原 trainer/train_sft_omni.py)
+#  Section 5: 训练主逻辑 —— omni_collate_fn, train_epoch, main
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def omni_collate_fn(batch):
@@ -2010,14 +1988,14 @@ def omni_collate_fn(batch):
     return input_ids, labels, audio_labels, audio_inputs, audio_lens, pixel_values, spk_emb
 
 
-def train_epoch(model, train_loader, optimizer, epoch, device, local_rank, args, wandb=None):
+def train_epoch(model, train_loader, optimizer, epoch, device, local_rank, args, swanlab_run=None):
     """
     单轮训练循环，包含：
     - 文本 & 音频双 Loss 计算
     - 梯度累积
     - 分布式梯度同步
     - 日志/checkpoint 输出
-    - Wandb/Swanlab 可视化管理
+    - Swanlab 可视化管理
     """
     model.train()
     total_loss = 0.0
@@ -2078,6 +2056,7 @@ def train_epoch(model, train_loader, optimizer, epoch, device, local_rank, args,
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
             optimizer.step()
             optimizer.zero_grad()
+            torch.cuda.empty_cache()
 
         total_loss += loss.item()
         total_text_loss += text_loss.item() / args.gradient_accumulation_steps
@@ -2104,31 +2083,22 @@ def train_epoch(model, train_loader, optimizer, epoch, device, local_rank, args,
 #                              Main 训练入口
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _init_wandb(args, resume_data=None):
-    """初始化 Wandb 或 Swanlab 可视化。"""
-    if not is_main_process() or not args.wandb_project:
+def _init_swanlab(args, resume_data=None):
+    """初始化 Swanlab 可视化实验跟踪。"""
+    if not is_main_process() or not args.swanlab_project:
         return None
     try:
         import swanlab
-        wandb_id = resume_data.get('wandb_id') if resume_data else None
+        run_id = resume_data.get('swanlab_id') if resume_data else None
         return swanlab.init(
-            project=args.wandb_project,
-            name=args.wandb_name or args.checkpoint_name,
-            resume=True if wandb_id else False,
-            id=wandb_id
+            project=args.swanlab_project,
+            experiment_name=args.swanlab_name or args.checkpoint_name,
+            resume='allow' if run_id else 'never',
+            id=run_id
         )
     except ImportError:
-        try:
-            import wandb as wb
-            wb.init(
-                project=args.wandb_project,
-                name=args.wandb_name or args.checkpoint_name,
-                resume='allow'
-            )
-            return wb
-        except ImportError:
-            Logger('Wandb/Swanlab 未安装，跳过可视化管理')
-            return None
+        Logger('Swanlab 未安装，跳过可视化管理')
+        return None
 
 
 def _create_dataloader(args, model, tokenizer, skip_batches=0):
@@ -2148,14 +2118,9 @@ def _create_dataloader(args, model, tokenizer, skip_batches=0):
         skip_batches=skip_batches
     )
     train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        sampler=train_sampler if not isinstance(train_sampler, SkipBatchSampler) else None,
-        batch_sampler=train_sampler if isinstance(train_sampler, SkipBatchSampler) else None,
-        collate_fn=omni_collate_fn,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        drop_last=True
+        train_dataset, batch_sampler=train_sampler,
+        collate_fn=omni_collate_fn, num_workers=args.num_workers,
+        pin_memory=True, drop_last=True
     )
     return train_dataset, sampler, train_loader
 
@@ -2201,9 +2166,9 @@ def main():
     parser.add_argument("--scheduled_sampling", type=float, default=0.05, help="Scheduled Sampling概率")
     parser.add_argument("--num_workers", type=int, default=2, help="DataLoader worker数")
 
-    # ── Wandb/Swanlab ──
-    parser.add_argument("--wandb_project", type=str, default='pigcpm', help="Wandb项目名")
-    parser.add_argument("--wandb_name", type=str, default=None, help="Wandb run名称")
+    # ── Swanlab ──
+    parser.add_argument("--swanlab_project", type=str, default='pigcpm', help="Swanlab项目名")
+    parser.add_argument("--swanlab_name", type=str, default=None, help="Swanlab实验名称")
 
     args = parser.parse_args()
 
@@ -2232,6 +2197,7 @@ def main():
         audio_encoder_path=args.audio_encoder_path,
         vision_model_path=args.vision_model_path,
         save_dir=args.save_dir,
+        checkpoint_dir=args.checkpoint_dir,
         device=device,
         freeze_backbone=args.freeze_backbone,
         from_resume=args.from_resume
@@ -2245,13 +2211,13 @@ def main():
     )
     start_epoch = 1
     global_step = 0
-    if resume_data is not None:
+    if args.from_resume > 0 and resume_data is not None:
         start_epoch = resume_data['epoch']
         global_step = resume_data['step']
         Logger(f'断点续训: epoch {start_epoch}, step {global_step}')
 
-    # ── Wandb / Swanlab ──
-    wandb = _init_wandb(args, resume_data)
+    # ── Swanlab ──
+    swanlab_run = _init_swanlab(args, resume_data)
 
     # ── 数据集 ──
     train_dataset, sampler, train_loader = _create_dataloader(
@@ -2293,7 +2259,7 @@ def main():
             sampler.set_epoch(epoch)
 
         train_loss, text_loss, audio_loss = train_epoch(
-            model, train_loader, optimizer, epoch, device, local_rank, args, wandb
+            model, train_loader, optimizer, epoch, device, local_rank, args, swanlab_run
         )
 
         Logger(f'Epoch {epoch} 完成 | Avg Loss: {train_loss:.4f} | '
@@ -2303,12 +2269,23 @@ def main():
         omni_checkpoint(
             omni_config, weight=args.checkpoint_name, model=model,
             optimizer=optimizer, epoch=epoch + 1, step=global_step,
-            wandb=wandb, save_dir=args.checkpoint_dir
+            swanlab_run=swanlab_run, save_dir=args.checkpoint_dir
         )
 
+    # ── 训练完成，同步权重到 out 目录 ──
+    moe_suffix = '_moe' if args.use_moe else ''
+    src = f'{args.checkpoint_dir}/{args.checkpoint_name}_{args.hidden_size}{moe_suffix}.pth'
+    dst = f'{args.save_dir}/{args.checkpoint_name}_{args.hidden_size}{moe_suffix}.pth'
+    if os.path.exists(src):
+        import shutil
+        os.makedirs(args.save_dir, exist_ok=True)
+        shutil.copy2(src, dst)
+        Logger(f'权重已同步至: {dst}')
+
     Logger('训练完成!')
-    if wandb and hasattr(wandb, 'finish'):
-        wandb.finish()
+    if swanlab_run is not None:
+        import swanlab
+        swanlab.finish()
 
 
 if __name__ == "__main__":
