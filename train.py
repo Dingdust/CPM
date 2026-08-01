@@ -1,16 +1,39 @@
+import io
 import os
 import math
-import torch
+import time
 import random
-import swanlab
+import logging
+import warnings
 import argparse
+from types import SimpleNamespace
+import contextlib
+from contextlib import nullcontext
+
+import swanlab
+import torch
 import numpy as np
+import torch.distributed as dist
 import torch.nn.functional as F
 
-from torch import nn
-from contextlib import nullcontext
+from torch import nn, optim
+from torch.nn.parallel import DistributedDataParallel
+from torch.utils.data import DataLoader, DistributedSampler
+
 from transformers.activations import ACT2FN
-from transformers import AutoTokenizer, GenerationMixin, PretrainedConfig, PreTrainedModel
+from transformers.modeling_outputs import MoeCausalLMOutputWithPast
+from transformers import (
+    AutoTokenizer, GenerationMixin, PretrainedConfig, PreTrainedModel,
+    SiglipImageProcessor, SiglipVisionModel, logging as hf_logging,
+)
+
+from dataset.omni_dataset import OmniDataset
+
+# 音频 codec 层数（8 路并行输出）
+AUDIO_CODEC_LAYERS = 8
+
+warnings.filterwarnings("ignore")
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 
 class PigCPMConfig(PretrainedConfig):
@@ -21,6 +44,8 @@ class PigCPMConfig(PretrainedConfig):
         self.use_moe = use_moe
         self.hidden_size = hidden_size
         self.hidden_layers = hidden_layers
+        # 统一层数命名：模型代码统一使用 num_hidden_layers
+        self.num_hidden_layers = kwargs.get("num_hidden_layers", hidden_layers)
 
         self.dropout = kwargs.get("dropout", 0.0)
         self.flash_attn = kwargs.get("flash_attn", True)
@@ -36,7 +61,7 @@ class PigCPMConfig(PretrainedConfig):
         self.tie_word_embeddings = kwargs.get("tie_word_embeddings", True)
         self.inference_rope_scaling = kwargs.get("inference_rope_scaling", False)
         self.max_position_embeddings = kwargs.get("max_position_embeddings", 32768)
-        self.head_dim = kwargs.get("head_dim", self.hidden_size // self.attention_heads)
+        self.head_dim = kwargs.get("head_dim", self.hidden_size // self.num_attention_heads)
         self.intermediate_size = kwargs.get("intermediate_size", math.ceil(hidden_size * math.pi / 64) * 64)
 
         self.rope_scaling = {
@@ -93,6 +118,52 @@ class RMSNorm(torch.nn.Module):
         return (self.weight * self.norm(x.float())).type_as(x)
 
 
+def precompute_freqs_cis(dim: int, end: int = int(32 * 1024), rope_base: float = 1e6, rope_scaling: dict = None):
+    """
+    预计算 RoPE（旋转位置编码）的 cos/sin 频率表。
+    支持 YaRN 扩展（用于推理时外推到更长上下文）。
+    返回: (freqs_cos, freqs_sin)，shape 均为 (end, dim)
+    """
+    freqs = 1.0 / (rope_base ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+    attn_factor = 1.0
+
+    if rope_scaling is not None:
+        orig_max = rope_scaling.get("original_max_position_embeddings", 2048)
+        factor = rope_scaling.get("factor", 16)
+        beta_fast = rope_scaling.get("beta_fast", 32.0)
+        beta_slow = rope_scaling.get("beta_slow", 1.0)
+        attn_factor = rope_scaling.get("attention_factor", 1.0)
+
+        if end / orig_max > 1.0:
+            # YaRN 频率插值公式
+            inv_dim = lambda b: (dim * math.log(orig_max / (b * 2 * math.pi))) / (2 * math.log(rope_base))
+            low = max(math.floor(inv_dim(beta_fast)), 0)
+            high = min(math.ceil(inv_dim(beta_slow)), dim // 2 - 1)
+            ramp = torch.clamp(
+                (torch.arange(dim // 2, device=freqs.device).float() - low) / max(high - low, 0.001),
+                0, 1
+            )
+            freqs = freqs * (1 - ramp + ramp / factor)
+
+    t = torch.arange(end, device=freqs.device)
+    freqs = torch.outer(t, freqs).float()
+    freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1) * attn_factor
+    freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1) * attn_factor
+    return freqs_cos, freqs_sin
+
+
+def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """GQA（分组查询注意力）：将 KV 头复制 n_rep 倍以匹配 Q 头数。"""
+    bs, slen, num_key_value_heads, head_dim = x.shape
+    if n_rep == 1:
+        return x
+    return (
+        x[:, :, :, None, :]
+        .expand(bs, slen, num_key_value_heads, n_rep, head_dim)
+        .reshape(bs, slen, num_key_value_heads * n_rep, head_dim)
+    )
+
+
 def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     def rotate_half(x):
         return torch.cat((-x[..., x.shape[-1] // 2:], x[..., : x.shape[-1] // 2]), dim = -1)
@@ -108,12 +179,9 @@ class Attention(nn.Module):
         self.is_causal = True
         self.head_dim = config.head_dim
         self.n_local_heads = config.num_attention_heads
-        self.n_local_kv_heads = self.num_key_value_heads
+        n_kv = config.num_key_value_heads if config.num_key_value_heads is not None else config.num_attention_heads
+        self.n_local_kv_heads = n_kv
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
-        if config.num_key_value_heads is None:
-            self.num_key_value_heads = config.num_attention_heads
-        else:
-            self.num_key_value_heads = config.num_key_value_heads
 
         self.q_proj = nn.Linear(config.hidden_size, config.num_attention_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
@@ -140,7 +208,7 @@ class Attention(nn.Module):
             xv = torch.cat([past_key_value[1], xv], dim=1)
         past_kv = (xk, xv) if use_cache else None
         xq, xk, xv = (xq.transpose(1, 2), repeat_kv(xk, self.n_rep).transpose(1, 2), repeat_kv(xv, self.n_rep).transpose(1, 2))
-        if self.flash and (seq_len > 1) and (not self.is_causal or past_key_value is None) and (attention_mask is None or torch.all(attention_mask == 1)):
+        if self.flash and (seq_len > 1) and (past_key_value is None) and (attention_mask is None or bool(attention_mask.min().item())):
             output = F.scaled_dot_product_attention(xq, xk, xv, dropout_p=self.dropout if self.training else 0.0, is_causal=self.is_causal)
         else:
             scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
@@ -189,7 +257,9 @@ class MOEFeedForward(nn.Module):
                 weight = topk_weight[mask].view(-1, 1)
                 y.index_add_(0, token_idx, (expert(x_flat[token_idx]) * weight).to(y.dtype))
             elif self.training:
-                y[0, 0] += 0 * sum(p.sum() for p in expert.parameters())
+                # dummy 梯度：让该 batch 未路由到的 expert 参数仍参与计算图，
+                # 避免 DDP 下因梯度缺失导致的 all-reduce 报错
+                y[0, 0] = y[0, 0] + 0 * sum(p.sum() for p in expert.parameters())
         if self.training and self.config.router_aux_loss_coef > 0:
             load = F.one_hot(topk_idx, self.config.num_experts).float().mean(0)
             self.aux_loss = (load * scores.mean(0)).sum() * self.config.num_experts * self.config.router_aux_loss_coef
@@ -282,7 +352,10 @@ class PigCPMForCausalLM(PreTrainedModel, GenerationMixin):
     
     @torch.inference_mode()
     def generate(self, inputs=None, attention_mask=None, max_new_tokens=8192, temperature=0.85, top_p=0.85, top_k=50, eos_token_id=2, streamer=None, use_cache=True, num_return_sequences=1, do_sample=True, repetition_penalty=1.0, **kwargs):
-        input_ids = kwargs.pop("input_ids", inputs).repeat(num_return_sequences, 1)
+        input_ids = kwargs.pop("input_ids", inputs)
+        if input_ids is None:
+            raise ValueError("generate() 需要传入 inputs 或 input_ids 参数")
+        input_ids = input_ids.repeat(num_return_sequences, 1)
         attention_mask = attention_mask.repeat(num_return_sequences, 1) if attention_mask is not None else None
         past_key_values = kwargs.pop("past_key_values", None)
         finished = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
@@ -313,6 +386,108 @@ class PigCPMForCausalLM(PreTrainedModel, GenerationMixin):
         if streamer: streamer.end()
         if kwargs.get("return_kv"): return {'generated_ids': input_ids, 'past_kv': past_key_values}
         return input_ids
+
+
+class MMAudioProjector(nn.Module):
+    """音频特征投影：SenseVoice fbank → LLM 隐藏空间"""
+
+    def __init__(self, in_dim, out_dim):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.LayerNorm(in_dim),
+            nn.Linear(in_dim, out_dim),
+            nn.GELU(),
+            nn.Linear(out_dim, out_dim),
+        )
+
+    def forward(self, x):
+        return self.mlp(x)
+
+
+class MMVisionProjector(nn.Module):
+    """视觉特征投影：SigLIP 图像嵌入 → LLM 隐藏空间"""
+
+    def __init__(self, in_dim, out_dim, source_tokens=64, target_tokens=64):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.LayerNorm(in_dim),
+            nn.Linear(in_dim, out_dim),
+            nn.GELU(),
+            nn.Linear(out_dim, out_dim),
+        )
+
+    def forward(self, x):
+        return self.mlp(x)
+
+
+class TalkerHead(nn.Module):
+    """Talker 输出头：8 路并行 codec 预测"""
+
+    def __init__(self, in_features, out_features, num_layers=AUDIO_CODEC_LAYERS, rank=256):
+        super().__init__()
+        self.num_layers = num_layers
+        self.base = nn.Linear(in_features, out_features, bias=False)
+        self.adapters = nn.ModuleList([nn.Sequential(nn.Linear(in_features, rank, bias=False), nn.GELU(), nn.Linear(rank, out_features, bias=False)) for _ in range(num_layers)])
+
+    def forward(self, x):
+        base_out = self.base(x)
+        return [base_out + adapter(x) for adapter in self.adapters]
+
+
+class TalkerEmbedding(nn.Module):
+    """Talker 嵌入：8 路并行 codec 嵌入的加权平均"""
+
+    def __init__(self, num_embeddings, embedding_dim, num_layers=AUDIO_CODEC_LAYERS, rank=256):
+        super().__init__()
+        self.num_layers = num_layers
+        self.base = nn.Embedding(num_embeddings, embedding_dim)
+        self.adapters = nn.ModuleList([nn.Sequential(nn.Embedding(num_embeddings, rank), nn.GELU(), nn.Linear(rank, embedding_dim, bias=False)) for _ in range(num_layers)])
+
+    def forward(self, x):
+        base_out = self.base(x)
+        return sum(base_out[:, i, :] + self.adapters[i](x[:, i, :]) for i in range(len(self.adapters))) / self.num_layers
+
+
+class SenseVoiceAudioProcessor:
+    """SenseVoice 音频预处理包装器：波形 → fbank 特征"""
+
+    def __init__(self, frontend):
+        self.frontend = frontend
+
+    def __call__(self, wav, sampling_rate=16000, return_tensors="pt", return_attention_mask=True, **kwargs):
+        if isinstance(wav, np.ndarray):
+            wav = torch.from_numpy(wav).float()
+        if wav.dim() == 1:
+            wav = wav.unsqueeze(0)
+        with torch.no_grad():
+            fbank, flen = self.frontend(wav, torch.tensor([wav.size(1)]))
+        return SimpleNamespace(
+            input_features=fbank,
+            attention_mask=(torch.arange(fbank.size(1)) < flen[0]).long().unsqueeze(0)
+        )
+
+
+class TalkerModule(nn.Module):
+    """
+    Talker（音频生成塔）：独立的小型 Transformer。
+    - 接收 Thinker 的桥接隐藏状态 + 音频 codec 嵌入
+    - 8 路并行输出头预测音频 codec 各层
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.talker_config = PigCPMConfig(hidden_size=config.talker_hidden_size, use_moe=config.use_moe)
+        self.layers = nn.ModuleList([PigCPMBlock(l, self.talker_config) for l in range(config.num_talker_hidden_layers)])
+        self.norm = RMSNorm(config.talker_hidden_size, eps=config.rms_norm_eps)
+        self.lm_head = TalkerHead(config.talker_hidden_size, config.audio_vocab_size)
+        self.embed_tokens = TalkerEmbedding(config.audio_vocab_size, config.talker_hidden_size)
+        self.codec_proj = nn.Sequential(nn.Linear(config.talker_hidden_size, config.talker_hidden_size), nn.GELU(), nn.Linear(config.talker_hidden_size, config.talker_hidden_size), RMSNorm(config.talker_hidden_size, eps=config.rms_norm_eps))
+        self.embed_proj = nn.Sequential(nn.Linear(config.hidden_size, config.hidden_size), nn.GELU(), nn.Linear(config.hidden_size, config.talker_hidden_size), RMSNorm(config.talker_hidden_size, eps=config.rms_norm_eps))
+        self.text_scale, self.audio_scale = nn.Parameter(torch.tensor(3.0)), nn.Parameter(torch.tensor(1.0))
+        self.spk_proj = nn.Linear(config.spk_emb_size, config.talker_hidden_size, bias=False)
+        freqs_cos, freqs_sin = precompute_freqs_cis(dim=self.talker_config.head_dim, end=config.max_position_embeddings, rope_base=config.rope_theta, rope_scaling=config.rope_scaling)
+        self.register_buffer("freqs_cos", freqs_cos, persistent=False)
+        self.register_buffer("freqs_sin", freqs_sin, persistent=False)
 
 
 class PigCPMOmni(PigCPMForCausalLM):
@@ -460,10 +635,10 @@ class PigCPMOmni(PigCPMForCausalLM):
         if len(input_ids.shape) == 2:
             batch_size, seq_length = input_ids.shape
             text_ids = input_ids
-            audio_ids = torch.full((batch_size, 8, seq_length), self.audio_pad_token, dtype=torch.long, device=input_ids.device)
+            audio_ids = torch.full((batch_size, AUDIO_CODEC_LAYERS, seq_length), self.audio_pad_token, dtype=torch.long, device=input_ids.device)
         else:
             batch_size, _, seq_length = input_ids.shape
-            text_ids, audio_ids = input_ids[:, 8, :], input_ids[:, :8, :]
+            text_ids, audio_ids = input_ids[:, AUDIO_CODEC_LAYERS, :], input_ids[:, :AUDIO_CODEC_LAYERS, :]
         if hasattr(past_key_values, 'layers'): past_key_values = None
         n_thinker, n_talker = len(self.thinker.layers), len(self.talker.layers)
         past_key_values = past_key_values or ([None] * (n_thinker + n_talker))
@@ -539,9 +714,9 @@ class PigCPMOmni(PigCPMForCausalLM):
 
     def stream_generate(self, input_ids, eos_token_id, max_new_tokens, temperature, top_p, rp, use_cache, return_audio_codes=False, **args):
         start_pos, past_kvs, text_finished, first_finished = input_ids.shape[1], None, False, True
-        audio_codes = [[] for _ in range(8)]
-        audio_stop_pos = [None] * 8
-        audio_buffer = torch.full((1, 8, start_pos), self.audio_pad_token, dtype=torch.long, device=input_ids.device)
+        audio_codes = [[] for _ in range(AUDIO_CODEC_LAYERS)]
+        audio_stop_pos = [None] * AUDIO_CODEC_LAYERS
+        audio_buffer = torch.full((1, AUDIO_CODEC_LAYERS, start_pos), self.audio_pad_token, dtype=torch.long, device=input_ids.device)
         spk_emb = args.get('spk_emb', None)
         ref_codes = args.get('ref_codes', None)
         ref_len = ref_codes.shape[2] if ref_codes is not None else 0
@@ -591,17 +766,17 @@ class PigCPMOmni(PigCPMForCausalLM):
                     audio_codes[i].append(code)
                     if audio_stop_pos[i] is None and code >= 2048: audio_stop_pos[i] = len(audio_codes[i]) - 1
 
-            if text_finished and all(audio_stop_pos[i] is not None for i in range(8)): break
+            if text_finished and all(audio_stop_pos[i] is not None for i in range(AUDIO_CODEC_LAYERS)): break
 
             input_ids = torch.cat((input_ids, torch.tensor([[text_token]], device=input_ids.device)), dim=1)
-            audio_buffer = torch.cat((audio_buffer, torch.full((1, 8, 1), self.audio_pad_token, dtype=torch.long, device=input_ids.device)), dim=2)
-            for i in range(min(audio_step + 1, 8)): audio_buffer[0, i, -1] = audio_codes[i][-1]
+            audio_buffer = torch.cat((audio_buffer, torch.full((1, AUDIO_CODEC_LAYERS, 1), self.audio_pad_token, dtype=torch.long, device=input_ids.device)), dim=2)
+            for i in range(min(audio_step + 1, AUDIO_CODEC_LAYERS)): audio_buffer[0, i, -1] = audio_codes[i][-1]
 
             audio_frame = None
-            if return_audio_codes and audio_step >= 7:
-                frame = [audio_codes[i][step - 7 + i] for i in range(8)]
-                active_layers = sum(1 for i in range(8) if audio_stop_pos[i] is None or step - 7 + i < audio_stop_pos[i])
-                if active_layers >= 8: audio_frame = frame
+            if return_audio_codes and audio_step >= AUDIO_CODEC_LAYERS - 1:
+                frame = [audio_codes[i][step - (AUDIO_CODEC_LAYERS - 1) + i] for i in range(AUDIO_CODEC_LAYERS)]
+                active_layers = sum(1 for i in range(AUDIO_CODEC_LAYERS) if audio_stop_pos[i] is None or step - (AUDIO_CODEC_LAYERS - 1) + i < audio_stop_pos[i])
+                if active_layers == AUDIO_CODEC_LAYERS: audio_frame = frame
             if not text_finished:
                 yield input_ids[:, start_pos:], audio_frame
                 if text_token == eos_token_id: text_finished = True
@@ -625,7 +800,8 @@ def omni_checkpoint(
         raw_model = getattr(raw_model, "_orig_mod", raw_model)
         # 移除冻结的 audio_encoder / vision_encoder 参数（不需要保存，从预训练路径重新加载）
         clean_state_dict = {k: v for k, v in raw_model.state_dict().items() if not k.startswith("audio_encoder.") and not k.startswith("vision_encoder.")}
-        state_dict = {k: v.half().cpu() for k, v in clean_state_dict.items()}
+        # 保留参数原始 dtype 保存，避免 bf16 训练权重转 fp16 造成精度损失
+        state_dict = {k: v.detach().cpu() for k, v in clean_state_dict.items()}
         ckp_tmp = f"{ckp_path}.tmp"
         torch.save(state_dict, ckp_tmp)
         os.replace(ckp_tmp, ckp_path)
@@ -679,7 +855,7 @@ def init_omni_model(
     vision_model_path: str = "./model/siglip2-base-p32-256-ve",
     device: str = "cuda", freeze_backbone: str = "none", resume: bool = False):
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-    model = PigCPMOmni(omni_config, audio_model_path=audio_model_path, vision_model_path=vision_model_path)
+    model = PigCPMOmni(omni_config, audio_encoder_path=audio_model_path, vision_model_path=vision_model_path)
     
     if from_weight != "none":
         moe_suffix = '_moe' if omni_config.use_moe else ''
@@ -691,13 +867,17 @@ def init_omni_model(
             if incompatible:
                 weights = {k: v for k, v in weights.items() if k not in incompatible}
             model.load_state_dict(weights, strict=False)
-            if from_resume == 0 and omni_config.talker_hidden_size == omni_config.hidden_size:
+            if not resume and omni_config.talker_hidden_size == omni_config.hidden_size:
                 n_talker = omni_config.num_talker_hidden_layers
                 n_thinker = len(model.thinker.layers)
                 has_talker = any(k.startswith('talker.layers.') for k in weights)
                 if not has_talker and n_talker > 0:
+                    if n_talker > n_thinker:
+                        warnings.warn(f"[init_omni_model] num_talker_hidden_layers({n_talker}) > num_hidden_layers({n_thinker})，talker 层无法从 thinker 复制初始化")
                     for i in range(n_talker):
                         src = n_thinker - n_talker + i
+                        if src < 0:
+                            continue
                         model.talker.layers[i].load_state_dict(model.thinker.layers[src].state_dict())
 
     # 冻结策略
@@ -714,6 +894,184 @@ def init_omni_model(
             for param in model.model.layers[-1].parameters():
                 param.requires_grad = True
     return model.to(device), tokenizer
+
+
+def is_main_process():
+    return not dist.is_initialized() or dist.get_rank() == 0
+
+
+def Logger(content):
+    if is_main_process():
+        print(content)
+
+
+def setup_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def init_distributed_mode():
+    """检测 RANK 环境变量：存在则初始化 DDP，否则单机运行。"""
+    if int(os.environ.get("RANK", -1)) == -1:
+        return 0
+    dist.init_process_group(backend="nccl")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    return local_rank
+
+
+def get_lr(current_step, total_steps, lr):
+    # 与 mmv 保持一致：初始 lr=1.0*base_lr，最终 lr=0.1*base_lr
+    return lr * (0.1 + 0.45 * (1 + math.cos(math.pi * current_step / total_steps)))
+
+
+class SkipBatchSampler(torch.utils.data.Sampler):
+    """resume 续训时跳过前 skip_batches 个 batch"""
+
+    def __init__(self, sampler, batch_size, skip_batches=0):
+        self.sampler = sampler
+        self.batch_size = batch_size
+        self.skip_batches = skip_batches
+
+    def __iter__(self):
+        batch = []
+        skipped = 0
+        for idx in self.sampler:
+            batch.append(idx)
+            if len(batch) == self.batch_size:
+                if skipped < self.skip_batches:
+                    skipped += 1
+                    batch = []
+                    continue
+                yield batch
+                batch = []
+        if len(batch) > 0 and skipped >= self.skip_batches:
+            yield batch
+
+    def __len__(self):
+        total_batches = (len(self.sampler) + self.batch_size - 1) // self.batch_size
+        return max(0, total_batches - self.skip_batches)
+
+
+def omni_collate_fn(batch):
+    """自定义 collate 函数，处理变长 audio_inputs 和 pixel_values"""
+    input_ids, labels, audio_labels, audio_inputs, audio_lens, pixel_values, spk_emb = zip(*batch)
+    input_ids = torch.stack(input_ids)
+    labels = torch.stack(labels)
+    audio_labels = torch.stack(audio_labels)
+    audio_lens = torch.tensor(audio_lens, dtype=torch.long)
+    valid_audios = [a for a in audio_inputs if a is not None]
+    if valid_audios:
+        max_t = max(a.size(1) for a in valid_audios)
+        padded = [a if a.size(1) == max_t else torch.nn.functional.pad(a, (0, 0, 0, max_t - a.size(1))) for a in valid_audios]
+        audio_inputs = torch.cat(padded, dim=0)
+    else:
+        audio_inputs = None
+    valid_images = [p for p in pixel_values if p is not None]
+    if valid_images:
+        if hasattr(valid_images[0], 'keys'):
+            keys = set.intersection(*[set(d.keys()) for d in valid_images])
+            pixel_values = {k: torch.cat([d[k] for d in valid_images], dim=0) for k in keys}
+        else:
+            pixel_values = torch.cat(valid_images, dim=0)
+    else:
+        pixel_values = None
+    spk_emb = torch.stack(spk_emb)
+    return input_ids, labels, audio_labels, audio_inputs, audio_lens, pixel_values, spk_emb
+
+
+def train_epoch(epoch, loader, iters, start_step=0):
+    """单 epoch 训练循环（使用模块级 args/omni_config/model/optimizer/scaler/autocast_ctx）"""
+    start_time = time.time()
+    last_step = start_step
+    for step, (input_ids, labels, audio_labels, audio_inputs, audio_lens, pixel_values, spk_emb) in enumerate(loader, start=start_step + 1):
+        input_ids = input_ids.to(args.device)
+        labels = labels.to(args.device)
+        audio_labels = audio_labels.to(args.device)
+        audio_lens = audio_lens.to(args.device)
+        if audio_inputs is not None:
+            audio_inputs = audio_inputs.to(args.device)
+        if pixel_values is not None:
+            if hasattr(pixel_values, 'keys'):
+                pixel_values = {k: v.to(args.device) for k, v in pixel_values.items()}
+            else:
+                pixel_values = pixel_values.to(args.device)
+        spk_emb = spk_emb.to(args.device)
+        last_step = step
+        lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
+
+        with autocast_ctx:
+            res = model(input_ids, audio_inputs=audio_inputs, audio_lens=audio_lens, pixel_values=pixel_values, spk_emb=spk_emb)
+            loss_fct = nn.CrossEntropyLoss(reduction='none')
+
+            # Text loss（只统计非 -100 位置）
+            text_loss_raw = loss_fct(res.logits.view(-1, res.logits.size(-1)), labels.view(-1))
+            text_mask = (labels.view(-1) != -100).float()
+            text_loss = (text_loss_raw * text_mask).sum() / (text_mask.sum() + 1e-9)
+
+            # Audio loss（8 层并行，stop token 加权 10 倍）
+            audio_loss = res.audio_logits[0].sum() * 0
+            for i, al in enumerate(res.audio_logits):
+                al_flat = al.view(-1, al.size(-1))
+                target_flat = audio_labels[:, i, :].reshape(-1)
+                layer_loss = loss_fct(al_flat, target_flat)
+                valid_mask = (target_flat != -100).float()
+                stop_mask = (target_flat == 2050).float()
+                weighted_loss = layer_loss * valid_mask * (1 + stop_mask * 9)
+                msum = valid_mask.sum()
+                if msum > 0:
+                    audio_loss = audio_loss + weighted_loss.sum() / (msum + 1e-9)
+            audio_loss = audio_loss / AUDIO_CODEC_LAYERS
+
+            loss = (text_loss + audio_loss + res.aux_loss) / args.accumulation_steps
+
+        scaler.scale(loss).backward()
+        if step % args.accumulation_steps == 0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)
+
+        if step % args.log_interval == 0 or step == iters:
+            spend_time = time.time() - start_time
+            current_loss = loss.item() * args.accumulation_steps
+            text_loss_val = text_loss.item() if isinstance(text_loss, torch.Tensor) else 0
+            audio_loss_val = audio_loss.item() if isinstance(audio_loss, torch.Tensor) else 0
+            current_lr = optimizer.param_groups[-1]['lr']
+            eta_min = spend_time / max(step - start_step, 1) * (iters - step) // 60
+            Logger(f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), loss: {current_loss:.4f}, text: {text_loss_val:.4f}, audio: {audio_loss_val:.4f}, lr: {current_lr:.8f}, eta: {eta_min:.1f}min')
+            swanlab.log({"loss": current_loss, "text_loss": text_loss_val, "audio_loss": audio_loss_val, "lr": current_lr})
+
+        if (step % args.save_interval == 0 or step == iters) and is_main_process():
+            model.eval()
+            raw_model = model.module if isinstance(model, DistributedDataParallel) else model
+            raw_model = getattr(raw_model, "_orig_mod", raw_model)
+            clean_state_dict = {k: v for k, v in raw_model.state_dict().items() if not k.startswith("audio_encoder.") and not k.startswith("vision_encoder.")}
+            moe_suffix = "_moe" if omni_config.use_moe else ""
+            ckp_path = f"{args.model_dir}/{args.model_prefix}_{omni_config.hidden_size}{moe_suffix}.pth"
+            os.makedirs(args.model_dir, exist_ok=True)
+            # 保留原始 dtype 保存，避免精度损失
+            torch.save({k: v.detach().cpu() for k, v in clean_state_dict.items()}, ckp_path)
+            omni_checkpoint(omni_config, model_prefix=args.model_prefix, checkpoint_dir=args.checkpoint_dir,
+                            model=model, optimizer=optimizer, epoch=epoch, step=step, wandb=swanlab, scaler=scaler)
+            model.train()
+
+        del input_ids, labels, audio_labels, audio_inputs, audio_lens, pixel_values, spk_emb, res, loss
+
+    if last_step > start_step and last_step % args.accumulation_steps != 0:
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad(set_to_none=True)
 
 
 if __name__ == "__main__":
@@ -773,25 +1131,25 @@ if __name__ == "__main__":
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
     autocast_ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast(dtype=dtype)
     
-    # ========== 4. 配swanlab ==========
-    resume_flag = "must" if swanlab_id else None
+    # ========== 4. 配swanlab（先取 swanlab_id 再计算 resume_flag） ==========
     swanlab_id = ckp_data.get("swanlab_id") if ckp_data else None
+    resume_flag = "must" if swanlab_id else None
     swanlab_run_name = f"{args.project_name}-{time.strftime('%Y%m%d-%H%M%S', time.gmtime(time.time() + 8 * 3600))}"
     swanlab.init(project=args.project_name, name=swanlab_run_name, id=swanlab_id, resume=resume_flag)
 
-    # ========== 5. 定义模型、数据、优化器 ==========
+    # ========== 5. 定义模型 ==========
     model, tokenizer = init_omni_model(
         omni_config,
+        from_weight=args.from_weight,
         device=args.device,
         resume=args.resume,
         model_dir=args.model_dir,
-        model_prefix=args.model_prefix,
         freeze_backbone=args.freeze_backbone,
         audio_model_path=args.audio_model_dir,
         vision_model_path=args.vision_model_dir,
-        )
+    )
     
-    if args.use_compile == 1:
+    if args.use_compile:
         model = torch.compile(model)
     
     if model.audio_encoder is not None:
@@ -809,5 +1167,51 @@ if __name__ == "__main__":
             p.requires_grad = False
         for p in model.vision_proj.parameters():
             p.requires_grad = True
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6
+    Logger(f'Trainable: {trainable:.2f}M | Mode: {args.train_mode} | Freeze: {args.freeze_backbone} | Compile: {"on" if args.use_compile else "off"}')
 
-        
+    # ========== 6. 数据集与优化器 ==========
+    train_ds = OmniDataset(
+        args.dataset,
+        tokenizer,
+        audio_processor=model.audio_processor,
+        vision_processor=model.vision_processor,
+        max_length=args.max_seq_len,
+        image_token_len=model.config.image_token_len,
+    )
+    train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
+    scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == "float16"))
+    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
+
+    # ========== 7. 从ckp恢复状态 ==========
+    start_epoch, start_step = 0, 0
+    if ckp_data:
+        model.load_state_dict(ckp_data["model"], strict=False)
+        optimizer.load_state_dict(ckp_data["optimizer"])
+        if "scaler" in ckp_data:
+            scaler.load_state_dict(ckp_data["scaler"])
+        start_epoch = ckp_data.get("epoch", 0)
+        start_step = ckp_data.get("step", 0)
+
+    # ========== 8. DDP包模型 ==========
+    if dist.is_initialized():
+        model = DistributedDataParallel(model, device_ids=[local_rank])
+
+    # ========== 9. 开始训练 ==========
+    for epoch in range(start_epoch, args.epochs):
+        if train_sampler:
+            train_sampler.set_epoch(epoch)
+        setup_seed(42 + epoch)
+        indices = torch.randperm(len(train_ds)).tolist()
+        skip = start_step if (epoch == start_epoch and start_step > 0) else 0
+        batch_sampler = SkipBatchSampler(train_sampler or indices, args.batch_size, skip)
+        loader = DataLoader(train_ds, batch_sampler=batch_sampler, collate_fn=omni_collate_fn, num_workers=args.num_workers, pin_memory=True)
+        if skip > 0:
+            Logger(f'Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始')
+            train_epoch(epoch, loader, len(loader) + skip, start_step)
+        else:
+            train_epoch(epoch, loader, len(loader), 0)
+
+    # ========== 10. 清理分布式进程 ==========
+    if dist.is_initialized():
+        dist.destroy_process_group()
