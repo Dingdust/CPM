@@ -5,9 +5,11 @@ import random
 import swanlab
 import argparse
 import numpy as np
+import torch.nn.functional as F
 
 from torch import nn
 from contextlib import nullcontext
+from transformers.activations import ACT2FN
 from transformers import AutoTokenizer, GenerationMixin, PretrainedConfig, PreTrainedModel
 
 
@@ -78,6 +80,7 @@ class OmniConfig(PigCPMConfig):
 
 
 class RMSNorm(torch.nn.Module):
+
     def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
         self.eps = eps
@@ -99,6 +102,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
 
 
 class Attention(nn.Module):
+
     def __init__(self, config: PigCPMConfig):
         super().__init__()
         self.is_causal = True
@@ -148,7 +152,54 @@ class Attention(nn.Module):
         return output, past_kv
 
 
+class FeedForward(nn.Module):
+
+    def __init__(self, config: PigCPMConfig, intermediate_size: int = None):
+        super().__init__()
+        intermediate_size = intermediate_size or config.intermediate_size
+        self.gate_proj = nn.Linear(config.hidden_size, intermediate_size, bias=False)
+        self.down_proj = nn.Linear(intermediate_size, config.hidden_size, bias=False)
+        self.up_proj = nn.Linear(config.hidden_size, intermediate_size, bias=False)
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    def forward(self, x):
+        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
+
+class MOEFeedForward(nn.Module):
+
+    def __init__(self, config: PigCPMConfig):
+        super().__init__()
+        self.config = config
+        self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
+        self.experts = nn.ModuleList([FeedForward(config, intermediate_size=config.moe_intermediate_size) for _ in range(config.num_experts)])
+        self.act_fn = ACT2FN[config.hidden_act]
+
+    def forward(self, x):
+        batch_size, seq_len, hidden_dim = x.shape
+        x_flat = x.view(-1, hidden_dim)
+        scores = F.softmax(self.gate(x_flat), dim=-1)
+        topk_weight, topk_idx = torch.topk(scores, k=self.config.num_experts_per_tok, dim=-1, sorted=False)
+        if self.config.norm_topk_prob: topk_weight = topk_weight / (topk_weight.sum(dim=-1, keepdim=True) + 1e-20)
+        y = torch.zeros_like(x_flat)
+        for i, expert in enumerate(self.experts):
+            mask = (topk_idx == i)
+            if mask.any():
+                token_idx = mask.any(dim=-1).nonzero().flatten()
+                weight = topk_weight[mask].view(-1, 1)
+                y.index_add_(0, token_idx, (expert(x_flat[token_idx]) * weight).to(y.dtype))
+            elif self.training:
+                y[0, 0] += 0 * sum(p.sum() for p in expert.parameters())
+        if self.training and self.config.router_aux_loss_coef > 0:
+            load = F.one_hot(topk_idx, self.config.num_experts).float().mean(0)
+            self.aux_loss = (load * scores.mean(0)).sum() * self.config.num_experts * self.config.router_aux_loss_coef
+        else:
+            self.aux_loss = scores.new_zeros(1).squeeze()
+        return y.view(batch_size, seq_len, hidden_dim)
+
+
 class PigCPMBlock(nn.Module):
+    
     def __init__(self, layer_id: int, config: PigCPMConfig):
         super().__init__()
         self.self_attn = Attention(config)
@@ -188,7 +239,6 @@ class PigCPMModel(nn.Module):
         past_key_values = past_key_values or [None] * len(self.layers)
         start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
         hidden_states = self.dropout(self.embed_tokens(input_ids))
-        # Recompute RoPE buffers lost during meta-device init (transformers>=5.x)
         if self.freqs_cos[0, 0] == 0:
             freqs_cos, freqs_sin = precompute_freqs_cis(dim=self.config.head_dim, end=self.config.max_position_embeddings, rope_base=self.config.rope_theta, rope_scaling=self.config.rope_scaling)
             self.freqs_cos, self.freqs_sin = freqs_cos.to(hidden_states.device), freqs_sin.to(hidden_states.device)
@@ -230,7 +280,6 @@ class PigCPMForCausalLM(PreTrainedModel, GenerationMixin):
             loss = F.cross_entropy(x.view(-1, x.size(-1)), y.view(-1), ignore_index=-100)
         return MoeCausalLMOutputWithPast(loss=loss, aux_loss=aux_loss, logits=logits, past_key_values=past_key_values, hidden_states=hidden_states)
     
-    # https://github.com/jingyaogong/minimind/discussions/611
     @torch.inference_mode()
     def generate(self, inputs=None, attention_mask=None, max_new_tokens=8192, temperature=0.85, top_p=0.85, top_k=50, eos_token_id=2, streamer=None, use_cache=True, num_return_sequences=1, do_sample=True, repetition_penalty=1.0, **kwargs):
         input_ids = kwargs.pop("input_ids", inputs).repeat(num_return_sequences, 1)
@@ -272,8 +321,8 @@ class PigCPMOmni(PigCPMForCausalLM):
     def __init__(self, config: OmniConfig = None, audio_encoder_path="./model/SenseVoiceSmall", vision_model_path="./model/siglip2-base-p32-256-ve"):
         config = config or OmniConfig()
         super().__init__(config)
-        object.__setattr__(self, 'thinker', self.model)  # alias: self.thinker == self.model
-        object.__setattr__(self.model, 'lm_head', self.lm_head)  # alias: self.thinker.lm_head == self.lm_head
+        object.__setattr__(self, 'thinker', self.model)
+        object.__setattr__(self.model, 'lm_head', self.lm_head)
         self.talker = TalkerModule(config)
         self.audio_proj = MMAudioProjector(config.audio_hidden_size, config.hidden_size)
         self.vision_proj = MMVisionProjector(config.image_hidden_size, config.hidden_size, target_tokens=config.image_token_len)
@@ -632,24 +681,24 @@ def init_omni_model(
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
     model = PigCPMOmni(omni_config, audio_model_path=audio_model_path, vision_model_path=vision_model_path)
     
-    # if from_weight != 'none':
-    #     moe_suffix = '_moe' if omni_config.use_moe else ''
-    #     weight_path = f'{model_dir}/{from_weight}_{omni_config.hidden_size}{moe_suffix}.pth'
-    #     if os.path.exists(weight_path):
-    #         weights = torch.load(weight_path, map_location=device)
-    #         param_shapes = {k: v.shape for k, v in model.named_parameters()}
-    #         incompatible = {k for k, v in weights.items() if k in param_shapes and v.shape != param_shapes[k]}
-    #         if incompatible:
-    #             weights = {k: v for k, v in weights.items() if k not in incompatible}
-    #         model.load_state_dict(weights, strict=False)
-    #         if from_resume == 0 and omni_config.talker_hidden_size == omni_config.hidden_size:
-    #             n_talker = omni_config.num_talker_hidden_layers
-    #             n_thinker = len(model.thinker.layers)
-    #             has_talker = any(k.startswith('talker.layers.') for k in weights)
-    #             if not has_talker and n_talker > 0:
-    #                 for i in range(n_talker):
-    #                     src = n_thinker - n_talker + i
-    #                     model.talker.layers[i].load_state_dict(model.thinker.layers[src].state_dict())
+    if from_weight != "none":
+        moe_suffix = '_moe' if omni_config.use_moe else ''
+        weight_path = f"{model_dir}/{from_weight}_{omni_config.hidden_size}{moe_suffix}.pth"
+        if os.path.exists(weight_path):
+            weights = torch.load(weight_path, map_location=device)
+            param_shapes = {k: v.shape for k, v in model.named_parameters()}
+            incompatible = {k for k, v in weights.items() if k in param_shapes and v.shape != param_shapes[k]}
+            if incompatible:
+                weights = {k: v for k, v in weights.items() if k not in incompatible}
+            model.load_state_dict(weights, strict=False)
+            if from_resume == 0 and omni_config.talker_hidden_size == omni_config.hidden_size:
+                n_talker = omni_config.num_talker_hidden_layers
+                n_thinker = len(model.thinker.layers)
+                has_talker = any(k.startswith('talker.layers.') for k in weights)
+                if not has_talker and n_talker > 0:
+                    for i in range(n_talker):
+                        src = n_thinker - n_talker + i
+                        model.talker.layers[i].load_state_dict(model.thinker.layers[src].state_dict())
 
     # 冻结策略
     if freeze_backbone == 'all':
